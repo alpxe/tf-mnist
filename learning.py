@@ -6,12 +6,11 @@
 import tensorflow as tf
 from tensorflow.python.training import moving_averages
 import numpy as np
-import cv2
 
 print(tf.__version__)
 
 
-def _bottleneck(x, d, out, stride=None, scope="bottleneck"):
+def _bottleneck(x, d, out, stride=None, training=True, scope="bottleneck"):
     """
     三层瓶颈结构为1X1，3X3和1X1卷积层
     其中两个1X1卷积用来减少或增加维度
@@ -30,21 +29,21 @@ def _bottleneck(x, d, out, stride=None, scope="bottleneck"):
     with tf.variable_scope(scope):
         # 1x1卷积核 如果stride默认且输入与输出的维度一致，则步长为2 卷积后的size/2
         h = conv2d(x, d, 1, stride=stride, scope="conv_1")  # [batch,size,size,align]->[batch,size,size,d]
-        h = batch_norm(h, scope="bn_1")
+        h = batch_norm(h, is_training=training, scope="bn_1")
         h = tf.nn.relu(h)
 
         # 3x3卷积核 [batch,size,size,d]->[batch,size,size,d]
         h = conv2d(h, d, 3, stride=1, scope="conv_2")
-        h = batch_norm(h, scope="bn_2")
+        h = batch_norm(h, is_training=training, scope="bn_2")
         h = tf.nn.relu(h)
 
         # 1x1卷积核 [batch,size,size,d]->[batch,size,size,out]
         h = conv2d(h, out, 1, stride=1, scope="conv_3")
-        h = batch_norm(h, scope="bn_3")
+        h = batch_norm(h, is_training=training, scope="bn_3")
 
         if align != out:  # 维度不同
             shortcut = conv2d(x, out, 1, stride=stride, scope="conv_4")
-            shortcut = batch_norm(shortcut, scope="bn_4")
+            shortcut = batch_norm(shortcut, is_training=training, scope="bn_4")
         else:
             shortcut = x
 
@@ -52,7 +51,7 @@ def _bottleneck(x, d, out, stride=None, scope="bottleneck"):
     pass
 
 
-def _block(x, out, n, init_stride=2, scope="block"):
+def _block(x, out, n, init_stride=2, training=True, scope="block"):
     """
     残差
     :param x: 输入
@@ -65,10 +64,10 @@ def _block(x, out, n, init_stride=2, scope="block"):
 
     with tf.variable_scope(scope):
         bok = out // 4  # 瓶颈值
-        net = _bottleneck(x, bok, out, stride=init_stride, scope="bottlencek1")
+        net = _bottleneck(x, bok, out, stride=init_stride, training=training, scope="bottlencek1")
 
         for i in range(1, n):
-            net = _bottleneck(net, bok, out, scope=("bottlencek%s" % (i + 1)))
+            net = _bottleneck(net, bok, out, training=training, scope=("bottlencek%s" % (i + 1)))
 
         return net
     pass
@@ -78,27 +77,27 @@ def batch_norm(x, decay=0.999, epsilon=1e-03, is_training=True,
                scope="scope"):
     x_shape = x.get_shape()
     num_inputs = x_shape[-1]
-    reduce_dims = list(range(len(x_shape) - 1))
+    reduce_dims = list(range(len(x_shape) - 1))  # 特征的通道数
     with tf.variable_scope(scope):
+        # 声明BN中唯一需要学习的两个参数，y=gamma*x+beta
         beta = tf.get_variable("bate", shape=[num_inputs, ], initializer=tf.zeros_initializer())
         gamma = tf.get_variable("gamma", shape=[num_inputs, ], initializer=tf.constant_initializer(1))
 
-        moving_mean = tf.get_variable("moving_mean", shape=[num_inputs, ], initializer=tf.zeros_initializer(),
-                                      trainable=False)
-        moving_variance = tf.get_variable("moving_variance", shape=[num_inputs, ], initializer=tf.zeros_initializer(),
-                                          trainable=False)
+        # 计算当前整个batch的均值与方差
+        batch_mean, batch_var = tf.nn.moments(x, axes=reduce_dims, name="moments")
 
-    if is_training:
-        mean, variance = tf.nn.moments(x, axes=reduce_dims)
-        update_move_mean = moving_averages.assign_moving_average(moving_mean,
-                                                                 mean, decay=decay)
-        update_move_variance = moving_averages.assign_moving_average(moving_variance,
-                                                                     variance, decay=decay)
-        tf.add_to_collection(tf.GraphKeys.UPDATE_OPS, update_move_mean)
-        tf.add_to_collection(tf.GraphKeys.UPDATE_OPS, update_move_variance)
-    else:
-        mean, variance = moving_mean, moving_variance
-    return tf.nn.batch_normalization(x, mean, variance, beta, gamma, epsilon)
+        # 采用滑动平均更新均值与方差
+        ema = tf.train.ExponentialMovingAverage(decay)
+
+        def mean_var_with_update():
+            ema_apply_op = ema.apply([batch_mean, batch_var])
+            with tf.control_dependencies([ema_apply_op]):
+                return tf.identity(batch_mean), tf.identity(batch_var)
+
+        # 训练时，更新均值与方差，测试时使用之前最后一次保存的均值与方差
+        mean, var = tf.cond(tf.equal(is_training, True), mean_var_with_update,
+                            lambda: (ema.average(batch_mean), ema.average(batch_var)))
+        return tf.nn.batch_normalization(x, mean, var, beta, gamma, epsilon)
 
 
 # 卷积
@@ -151,11 +150,11 @@ def __format(record):
     # label
     label = tf.reshape(fats["label"], [])
     label = tf.one_hot(label, 10)
-    label = tf.cast(label, dtype=tf.float32)
+    # label = tf.cast(label, dtype=tf.float32)
 
     # image
     image = tf.reshape(fats["image"], [28, 28, 1])
-    image = tf.cast(image, dtype=tf.float32)
+    # image = tf.cast(image, dtype=tf.float32)
 
     return label, image
 
@@ -170,17 +169,23 @@ dataset = dataset.batch(50)
 iterator = dataset.make_one_shot_iterator()
 label, image = iterator.get_next()
 
+label = tf.cast(label, dtype=tf.float32)
+
+with tf.variable_scope("holder"):
+    input_image = tf.cast(image, dtype=tf.float32, name="input_image")
+    is_training = tf.placeholder(dtype=tf.bool, name="is_training")
+
 # 2.>>>>残差神经网络
 with tf.variable_scope("resnet"):
-    net = conv2d(image, 32, 3, 1, "conv1")  # 卷积 [?,28,28,1] -> [?,28,28,32]
-    net = tf.nn.relu(batch_norm(net, scope="bn1"))  # BN >>> relu
+    net = conv2d(input_image, 32, 3, 1, "conv1")  # 卷积 [?,28,28,1] -> [?,28,28,32]
+    net = tf.nn.relu(batch_norm(net, is_training=is_training, scope="bn1"))  # BN >>> relu
     net = max_pool(net, 2, 2, "maxpool1")  # [?,28,28,32] -> [?,14,14,32]
 
-    net = _block(net, 256, 3, 1, scope="block_2")  # [?,14,14,256]
+    net = _block(net, 256, 3, 1, training=is_training, scope="block_2")  # [?,14,14,256]
     print(net.get_shape())
-    net = _block(net, 512, 4, 1, scope="block3")  # [?,14,14,512]
+    net = _block(net, 512, 4, 1, training=is_training, scope="block3")  # [?,14,14,512]
     print(net.get_shape())
-    net = _block(net, 1024, 3, 2, scope="block4")  # [?,7,7,1024]
+    net = _block(net, 1024, 3, 2, training=is_training, scope="block4")  # [?,7,7,1024]
     print(net.get_shape())
 
     # 展开
@@ -206,7 +211,7 @@ with tf.variable_scope("logit"):
     loss = tf.reduce_mean(-tf.reduce_sum(label * (tf.log(softmax) / tf.log(2.)), 1))
     tf.summary.scalar('loss', loss)  # 与tensorboard 有关
 
-    train = tf.train.AdamOptimizer(1e-4).minimize(loss)
+    train = tf.train.AdamOptimizer(1e-5).minimize(loss)
 
     pass
 
@@ -218,12 +223,12 @@ with tf.Session() as sess:
 
     # saver = tf.train.Saver()  # 初始化 Saver
 
-    for i in range(5000 + 1):
-        sess.run([train, loss])
+    for i in range(8000 + 1):
+        sess.run([train, loss], feed_dict={is_training: True})
         if i % 10 == 0:
-            _, ls, sx, mrg = sess.run([train, loss, softmax, merge])
+            _, ls, sx, mrg = sess.run([train, loss, softmax, merge], feed_dict={is_training: True})
             writer.add_summary(mrg, i)  #
-            print("[step_{0}]:\n\tloss损失值:{1}\n\ttsoftmax:{2}\n".format(i, ls, sx))
+            print("[step_{0}]:\t\tloss损失值:{1}\n".format(i, ls))
 
             # saver.save(sess, save_path='ckp/')  # 储存神经网络的变量
             pass
