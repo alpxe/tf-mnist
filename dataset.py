@@ -60,4 +60,4 @@ def create(IMAGES, LABELS, NAME):
 
 
 
-create(TRAIN_IMAGES, TRAIN_LABELS, "train.tfrecords")
+create(TRAIN_IMAGES, TRAIN_LABELS, "train.tfrecord")
